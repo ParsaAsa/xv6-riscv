@@ -10,6 +10,8 @@
 #include "defs.h"
 #include "proc.h"
 
+int npage = 0; // Global page counter
+
 int refcnt[PHYSTOP / PGSIZE];
 struct spinlock refcnt_lock;
 
@@ -87,6 +89,7 @@ void kfree(void *pa)
   acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
+  npage++; // Increment when freeing
   release(&kmem.lock);
 }
 
@@ -101,61 +104,46 @@ kalloc(void)
   struct run *r;
   struct proc *p = myproc();
 
-  // --- Step 1: Standard Allocation Attempt ---
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  
+  // Reserve check
+  if(r && npage < 32 && p && !p->is_kproc && !p->is_swapping) {
+    r = 0; 
+  }
+
+  if(r) {
     kmem.freelist = r->next;
-  release(&kmem.lock);
+    npage--;
+    release(&kmem.lock); // RELEASE HERE: We got a page, we are done with kmem.lock
+  } else {
+    release(&kmem.lock); // RELEASE HERE: We didn't get a page, must release before sleeping/recursing
 
-  // --- Step 2: Out of Memory (OOM) Handling ---
-  if(r == 0){
-    /* Safety Guards: 
-       1. p == 0: We are in early boot (main/kinit). Cannot swap yet.
-       2. p->is_kproc: The swap worker itself or other kernel threads shouldn't trigger swap.
-       3. p->is_swapping: Prevent recursive loops where kalloc -> swap -> kalloc.
-    */
-    if(p != 0 && p->is_kproc == 0 && p->is_swapping == 0){
-      p->is_swapping = 1; // Set the flag to protect this process
-
+    // Try to trigger swap if we are a user process
+    if(p && !p->is_kproc && !p->is_swapping) {
       acquire(&swap_lock);
-      // Wake up the swap_out_worker (Phase 2)
       global_swap_req.is_active = 1;
-      global_swap_req.p = p; 
+      global_swap_req.type = SWAP_OUT;
       wakeup(&global_swap_req);
-
-      // Wait for the worker to finish evicting a page
-      while(global_swap_req.is_active == 1){
-        sleep(&global_swap_req, &swap_lock);
-      }
+      
+      // sleep() will release swap_lock and re-acquire it on wakeup
+      sleep(&global_swap_req, &swap_lock);
       release(&swap_lock);
-
-      p->is_swapping = 0; // Unset the flag
-
-      // --- Step 3: Final Attempt ---
-      // Try to grab the page the worker just freed
-      acquire(&kmem.lock);
-      r = kmem.freelist;
-      if(r)
-        kmem.freelist = r->next;
-      release(&kmem.lock);
+      
+      // RECURSION IS SAFE NOW: kmem.lock was released at line 20
+      return kalloc(); 
     }
+    return 0;
   }
 
-  // --- Step 4: Initialization ---
-  if(r){
-    // Fill with junk (5) to catch dangling references
-    memset((char*)r, 5, PGSIZE);
-
-    // Initialize reference count to 1
-    acquire(&refcnt_lock);
-    refcnt[(uint64)r / PGSIZE] = 1;
-    release(&refcnt_lock);
-  }
+  // Initialization (Outside the lock)
+  memset((char*)r, 5, PGSIZE);
+  acquire(&refcnt_lock);
+  refcnt[(uint64)r / PGSIZE] = 1;
+  release(&refcnt_lock);
 
   return (void*)r;
 }
-
 
 
 

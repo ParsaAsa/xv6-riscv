@@ -6,7 +6,7 @@ main(int argc, char *argv[])
 {
   printf("Hog: Starting to consume memory...\n");
 
-  for(int i = 0; i < 10000; i++){
+  for(int i = 0; i < 1000; i++){
     char *p = sbrk(4096); // Request one page
     if(p == (char*)-1){
       printf("Hog: sbrk failed at page %d. Waiting for swap...\n", i);

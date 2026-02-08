@@ -820,47 +820,52 @@ void
 swap_out_worker(void)
 {
   struct proc *kproc = myproc();
-  // Ensure we aren't holding our own lock from boot/scheduler
-  release(&kproc->lock);
+
+  // The worker starts in the scheduler with kproc->lock held.
+  // We must release it once and ONLY once before entering the loop.
+  if(holding(&kproc->lock))
+    release(&kproc->lock);
 
   for(;;){
     acquire(&swap_lock);
-    // Wait for kalloc to signal that memory is low
     while(global_swap_req.is_active == 0)
       sleep(&global_swap_req, &swap_lock);
+
+    // Set swapping flag so this kproc can bypass the kalloc reserve
+    kproc->is_swapping = 1;
 
     uint64 va;
     struct proc *victim_p = 0;
     
-    // Call the GLOBAL victim selection (the one we fixed earlier)
+    // select_victim_page returns with victim_p->lock ACQUIRED
     pte_t *pte = select_victim_page(&va, &victim_p);
 
     if(pte != 0 && victim_p != 0){
       uint64 pa = PTE2PA(*pte);
       
-      // 1. Mark as Swapped in Page Table
-      // Clear Valid bit, keep existing flags, set our custom PTE_SWAP bit
+      // 1. Mark as Swapped
       uint64 flags = PTE_FLAGS(*pte);
       *pte = PA2PTE(pa) | flags | PTE_SWAP;
       *pte &= ~PTE_V;
 
       // 2. Flush TLB
-      // The hardware must know the translation for 'va' is no longer valid
       sfence_vma();
 
-      // 3. Free the physical memory
-      // This is what kalloc is waiting for!
+      // 3. RELEASE the victim's lock now. 
+      // We've modified their PTE; we don't need the lock for kfree or printf.
+      release(&victim_p->lock); 
+
+      // 4. Free the memory (this wakes up kalloc)
       kfree((void*)pa);
 
-      printf("Swap-out: Evicted VA %p from PID %d to free physical page %p\n", 
-              (void*)va, victim_p->pid, (void*)pa);
-    } else {
-      // Optional: if no victim found, you might want to log a warning
-      // printf("Swap-out: No victim found to evict!\n");
+      // Use %p with (void*) cast to avoid compiler errors
+      printf("Swap-out: Evicted VA %p from PID %d\n", (void*)va, victim_p->pid);
     }
 
-    // Signal kalloc that we have finished an eviction attempt
+    kproc->is_swapping = 0;
     global_swap_req.is_active = 0;
+    
+    // Wake up the kalloc() that is sleeping on this request
     wakeup(&global_swap_req);
     release(&swap_lock);
   }
@@ -875,44 +880,41 @@ select_victim_page(uint64 *va_out, struct proc **p_out)
   struct proc *p;
   pte_t *pte;
 
-  // Global Clock: Loop through all processes starting where we left off
   for(int i = 0; i < NPROC; i++){
     int p_idx = (last_proc_idx + i) % NPROC;
     p = &proc[p_idx];
 
+    // Don't try to lock if we are already holding it (safety)
+    if(holding(&p->lock)) continue;
+
     acquire(&p->lock);
-    // Only pick from running user processes that aren't the swap worker
-    if(p->state != USED && p->state != RUNNING && p->state != RUNNABLE){
-      release(&p->lock);
-      continue;
-    }
-    if(p->is_kproc || p->pid <= 2){ // Skip init and swap_out_worker
+    // 1. Skip if process is not active or is a kernel process
+    if(p->state == UNUSED || p->is_kproc || p->pid <= 2){
       release(&p->lock);
       continue;
     }
 
-    // Scan this process's memory
-    // Note: In a true clock, you'd store a 'p->clock_hand' as well
+    // 2. Only scan up to p->sz. 
+    // This naturally avoids TRAPFRAME and TRAMPOLINE which are ABOVE p->sz.
     for(uint64 va = 0; va < p->sz; va += PGSIZE){
       pte = walk(p->pagetable, va, 0);
       
-      if(pte && (*pte & PTE_V) && (*pte & PTE_U)){
+      // 3. CRITICAL: Only evict if Valid, User, and NOT already Swapped
+      if(pte && (*pte & PTE_V) && (*pte & PTE_U) && !(*pte & PTE_SWAP)){
         if(*pte & PTE_A){
-          // Second chance: clear accessed bit
-          *pte &= ~PTE_A;
+          *pte &= ~PTE_A; // Second chance
         } else {
-          // Found a victim that hasn't been accessed recently!
           *va_out = va;
           *p_out = p;
-          last_proc_idx = p_idx; // Move the global hand
-          release(&p->lock);
+          last_proc_idx = p_idx; 
+          // Return with p->lock HELD (the worker will release it)
           return pte;
         }
       }
     }
     release(&p->lock);
   }
-  return 0; // No victim found
+  return 0;
 }
 
 void
