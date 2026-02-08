@@ -840,27 +840,33 @@ swap_out_worker(void)
     // select_victim_page returns with victim_p->lock ACQUIRED
     pte_t *pte = select_victim_page(&va, &victim_p);
 
-    if(pte != 0 && victim_p != 0){
+if(pte != 0 && victim_p != 0){
       uint64 pa = PTE2PA(*pte);
       
-      // 1. Mark as Swapped
+      int slot = swap_alloc_slot();
+      if(slot < 0) {
+        printf("Swap-out: No disk space!\n");
+        release(&victim_p->lock);
+        goto skip;
+      }
+
+      // 1. Copy data to "disk"
+      extern char swap_disk[128][4096]; // Tell compiler it's in kalloc.c
+      memmove(swap_disk[slot], (void*)pa, PGSIZE);
+
+      // 2. Mark PTE with the slot number
+      // We store the slot in the high bits of the PTE (above the flags)
       uint64 flags = PTE_FLAGS(*pte);
-      *pte = PA2PTE(pa) | flags | PTE_SWAP;
-      *pte &= ~PTE_V;
+      *pte = ((uint64)slot << 12) | flags | PTE_SWAP; 
+      *pte &= ~PTE_V; // Mark invalid
 
-      // 2. Flush TLB
       sfence_vma();
-
-      // 3. RELEASE the victim's lock now. 
-      // We've modified their PTE; we don't need the lock for kfree or printf.
       release(&victim_p->lock); 
-
-      // 4. Free the memory (this wakes up kalloc)
       kfree((void*)pa);
 
-      // Use %p with (void*) cast to avoid compiler errors
-      printf("Swap-out: Evicted VA %p from PID %d\n", (void*)va, victim_p->pid);
+      printf("Swap-out: VA %p -> Slot %d\n", (void*)va, slot);
     }
+    skip:
 
     kproc->is_swapping = 0;
     global_swap_req.is_active = 0;
@@ -917,23 +923,43 @@ select_victim_page(uint64 *va_out, struct proc **p_out)
   return 0;
 }
 
+// kernel/proc.c
+
 void
 handle_swap_in(uint64 va)
 {
-  acquire(&swap_lock);
+  struct proc *p = myproc();
+  va = PGROUNDDOWN(va);
   
-  global_swap_req.p = myproc();
-  global_swap_req.va = PGROUNDDOWN(va);
-  global_swap_req.type = SWAP_IN;
-  global_swap_req.is_active = 1;
+  pte_t *pte = walk(p->pagetable, va, 0);
+  if(!pte || !(*pte & PTE_SWAP)) return;
+
+  // 1. Get the slot we stored earlier
+  int slot = (*pte) >> 12;
+
+  // 2. Allocate a fresh physical page
+  char *pa = kalloc();
+  if(pa == 0){
+    // If kalloc returns 0, kalloc is already handling the sleep/swap logic
+    // We just return and let usertrap retry the instruction.
+    return; 
+  }
+
+  // 3. Copy data back from fake disk
+  extern char swap_disk[128][4096];
+  extern int swap_map[128];
+  memmove(pa, swap_disk[slot], PGSIZE);
   
-  wakeup(&global_swap_req); // Wake worker
-  
-  // Wait for worker to finish
-  while(global_swap_req.is_active)
-    sleep(&global_swap_req, &swap_lock);
-    
-  release(&swap_lock);
+  // 4. Update PTE: Set Valid, Clear Swap bit, Link to new PA
+  uint64 flags = PTE_FLAGS(*pte);
+  flags &= ~PTE_SWAP;
+  flags |= PTE_V;
+  *pte = PA2PTE(pa) | flags;
+
+  // 5. Free the disk slot
+  swap_map[slot] = 0;
+
+  sfence_vma();
 }
 
 void

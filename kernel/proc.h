@@ -6,7 +6,7 @@
 #include "vm.h"
 
 
-#define MAX_SWAP_PAGES 32 // Adjust based on requirements
+#define MAX_SWAP_PAGES 128 // Adjust based on requirements
 enum swap_type { SWAP_OUT, SWAP_IN };
 
 struct swap_request {

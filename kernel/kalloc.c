@@ -10,6 +10,20 @@
 #include "defs.h"
 #include "proc.h"
 
+char swap_disk[MAX_SWAP_PAGES][PGSIZE]; // Our fake storage
+int swap_map[MAX_SWAP_PAGES];           // 0 = free, 1 = used
+
+// Find a free slot in our fake disk
+int swap_alloc_slot() {
+  for(int i = 0; i < MAX_SWAP_PAGES; i++){
+    if(swap_map[i] == 0){
+      swap_map[i] = 1;
+      return i;
+    }
+  }
+  return -1;
+}
+
 int npage = 0; // Global page counter
 
 int refcnt[PHYSTOP / PGSIZE];
@@ -121,18 +135,23 @@ kalloc(void)
 
     // Try to trigger swap if we are a user process
     if(p && !p->is_kproc && !p->is_swapping) {
-      acquire(&swap_lock);
-      global_swap_req.is_active = 1;
-      global_swap_req.type = SWAP_OUT;
-      wakeup(&global_swap_req);
-      
-      // sleep() will release swap_lock and re-acquire it on wakeup
-      sleep(&global_swap_req, &swap_lock);
-      release(&swap_lock);
-      
-      // RECURSION IS SAFE NOW: kmem.lock was released at line 20
-      return kalloc(); 
-    }
+        acquire(&swap_lock);
+        // ... trigger worker ...
+        sleep(&global_swap_req, &swap_lock);
+        release(&swap_lock);
+
+        // Check if the worker actually freed any pages
+        acquire(&kmem.lock);
+        int pages_now = npage;
+        release(&kmem.lock);
+
+        if(pages_now < 32) {
+            printf("Out of memory and swap space! Killing PID %d\n", p->pid);
+            setkilled(p);
+            return 0;
+        }
+        return kalloc(); 
+}
     return 0;
   }
 

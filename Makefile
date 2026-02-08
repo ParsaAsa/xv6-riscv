@@ -153,6 +153,8 @@ UPROGS=\
 	$U/_program2\
 	$U/_cowtest\
 	$U/_hog\
+	$U/_testswap\
+
 
 
 

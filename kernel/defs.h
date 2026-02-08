@@ -72,6 +72,7 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+int             swap_alloc_slot(void); // Add this line
 
 // log.c
 void            initlog(int, struct superblock*);
