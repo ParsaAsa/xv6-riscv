@@ -16,5 +16,6 @@
 #define TARGET_LATENCY   20   // ticks
 #define MIN_GRANULARITY  2    // ticks
 #define NICE_0_LOAD      1024
-
+#define SWAP_START_BLOCK 1000  // Pick a safe area on the disk
+#define SWAP_MAX_BLOCKS  2000  // Total space for swap
 

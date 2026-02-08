@@ -42,44 +42,44 @@ usertrap(void)
   if((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
-  // send interrupts and exceptions to kerneltrap(),
-  // since we're now in the kernel.
-  w_stvec((uint64)kernelvec);  //DOC: kernelvec
+  w_stvec((uint64)kernelvec); 
 
   struct proc *p = myproc();
-  
-  // save user program counter.
   p->trapframe->epc = r_sepc();
   
   if(r_scause() == 8){
-    // system call
-
+    // System call
     if(killed(p))
       kexit(-1);
-
-    // sepc points to the ecall instruction,
-    // but we want to return to the next instruction.
     p->trapframe->epc += 4;
-
-    // an interrupt will change sepc, scause, and sstatus,
-    // so enable only now that we're done with those registers.
     intr_on();
-
     syscall();
   } else if((which_dev = devintr()) != 0){
-    // ok
-  } else if(r_scause() == 15) {
-      // handle COW write fault
-      if(cowfault(r_stval()) < 0) {
-          setkilled(p);   // kill the process if fault handling fails
+    // Device interrupt (Timer, Disk, etc.)
+  } else if(r_scause() == 13 || r_scause() == 15) {
+    uint64 va = r_stval();
+    
+    if(va >= TRAMPOLINE) {
+      setkilled(p);
+    } else {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      
+      // 1. SWAP-IN: Highest priority
+      if(pte && (*pte & PTE_SWAP)) {
+          handle_swap_in(va);
+          // If the swap failed or the process was killed during disk I/O
+          if(killed(p)) kexit(-1);
+      } 
+      // 2. COW: Only on Store Page Fault (15)
+      else if(r_scause() == 15 && cowfault(va) >= 0) {
+          // Handled successfully
       }
-  }
-  else if((r_scause() == 15 || r_scause() == 13) &&
-            vmfault(p->pagetable, r_stval(),
-                    (r_scause() == 13)) != 0){
-    // page fault on lazily-allocated page
-  }
-  else {
+      // 3. Lazy Allocation
+      else if(vmfault(p->pagetable, va, (r_scause() == 13)) != 0) {
+          setkilled(p);
+      }
+    }
+  } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
@@ -88,16 +88,16 @@ usertrap(void)
   if(killed(p))
     kexit(-1);
 
-  // give up the CPU if this is a timer interrupt.
+  // --- CFS Scheduler Logic ---
   if(which_dev == 2){
-    struct proc *p = myproc();
     if(p){
       p->runtime++;
-
-      p->vruntime += NICE_0_LOAD / p->weight;
+      // Weight-based vruntime increment
+      p->vruntime += (NICE_0_LOAD / p->weight);
 
       if(p->runtime >= p->timeslice){
         p->runtime = 0;
+        // Check for held locks before yielding to prevent 'sched locks' panic
         yield();
       }
     }
@@ -105,10 +105,7 @@ usertrap(void)
 
   prepare_return();
 
-  // the user page table to switch to, for trampoline.S
   uint64 satp = MAKE_SATP(p->pagetable);
-
-  // return to trampoline.S; satp value in a0.
   return satp;
 }
 

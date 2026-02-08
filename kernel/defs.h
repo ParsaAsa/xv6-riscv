@@ -3,6 +3,8 @@
 #include "vm.h"
 
 
+
+
 // physical memory reference counting
 void incref(uint64 pa);
 void decref(uint64 pa);
@@ -89,6 +91,11 @@ void            panic(char*) __attribute__((noreturn));
 void            printfinit(void);
 
 // proc.c
+void            create_kernel_process(const char*, void (*)(void));
+extern struct spinlock swap_lock;
+extern struct swap_request global_swap_req;
+void            handle_swap_in(uint64);
+void            create_kernel_process(const char*, void (*)(void));
 int             cpuid(void);
 void            kexit(int);
 int             kfork(void);

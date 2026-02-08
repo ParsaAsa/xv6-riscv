@@ -3,10 +3,15 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
-#include "uproc.h"
+#include "../uproc.h"
 #include "defs.h"
 #include <math.h>
 #include "rbt.h"
+#include "proc.h"
+
+void create_kernel_process(const char *name, void (*entrypoint)(void));
+void swap_out_worker(void);
+pte_t *select_victim_page(uint64 *va_out, struct proc **p_out);
 
 extern struct proc proc[NPROC];
 struct rbt runqueue;
@@ -92,6 +97,8 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+
+
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -115,6 +122,10 @@ proc_mapstacks(pagetable_t kpgtbl)
   }
 }
 
+
+struct spinlock swap_lock;
+struct swap_request global_swap_req;
+
 // initialize the proc table.
 void
 procinit(void)
@@ -122,12 +133,18 @@ procinit(void)
   rbt_init(&runqueue);
 
   struct proc *p;
-  
+
+  initlock(&swap_lock, "swap_lock");
+  global_swap_req.is_active = 0;
+
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
+      p->is_kproc = 0;
+      p->is_swapping = 0;
+      p->vruntime = 0;
       p->kstack = KSTACK((int) (p - proc));
   }
 }
@@ -198,6 +215,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->is_kproc = 0;
+  p->is_swapping = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -306,10 +325,11 @@ userinit(void)
   initproc = p;
   
   p->cwd = namei("/");
-
   p->state = RUNNABLE;
 
   release(&p->lock);
+
+  create_kernel_process("swap_out", swap_out_worker);
 }
 
 // Grow or shrink user memory by n bytes.
@@ -531,8 +551,9 @@ scheduler(void)
       if(p->state == RUNNABLE){
         if(chosen == 0 || p->vruntime < chosen->vruntime){
           if(chosen)
-            release(&chosen->lock);
+            release(&chosen->lock); // Release the old "best" candidate
           chosen = p;
+          // Keep p->lock held for the new chosen one!
         } else {
           release(&p->lock);
         }
@@ -793,4 +814,147 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+void
+swap_out_worker(void)
+{
+  struct proc *kproc = myproc();
+  // Ensure we aren't holding our own lock from boot/scheduler
+  release(&kproc->lock);
+
+  for(;;){
+    acquire(&swap_lock);
+    // Wait for kalloc to signal that memory is low
+    while(global_swap_req.is_active == 0)
+      sleep(&global_swap_req, &swap_lock);
+
+    uint64 va;
+    struct proc *victim_p = 0;
+    
+    // Call the GLOBAL victim selection (the one we fixed earlier)
+    pte_t *pte = select_victim_page(&va, &victim_p);
+
+    if(pte != 0 && victim_p != 0){
+      uint64 pa = PTE2PA(*pte);
+      
+      // 1. Mark as Swapped in Page Table
+      // Clear Valid bit, keep existing flags, set our custom PTE_SWAP bit
+      uint64 flags = PTE_FLAGS(*pte);
+      *pte = PA2PTE(pa) | flags | PTE_SWAP;
+      *pte &= ~PTE_V;
+
+      // 2. Flush TLB
+      // The hardware must know the translation for 'va' is no longer valid
+      sfence_vma();
+
+      // 3. Free the physical memory
+      // This is what kalloc is waiting for!
+      kfree((void*)pa);
+
+      printf("Swap-out: Evicted VA %p from PID %d to free physical page %p\n", 
+              (void*)va, victim_p->pid, (void*)pa);
+    } else {
+      // Optional: if no victim found, you might want to log a warning
+      // printf("Swap-out: No victim found to evict!\n");
+    }
+
+    // Signal kalloc that we have finished an eviction attempt
+    global_swap_req.is_active = 0;
+    wakeup(&global_swap_req);
+    release(&swap_lock);
+  }
+}
+
+// Global hand to keep track of which process we checked last
+int last_proc_idx = 0;
+
+pte_t *
+select_victim_page(uint64 *va_out, struct proc **p_out)
+{
+  struct proc *p;
+  pte_t *pte;
+
+  // Global Clock: Loop through all processes starting where we left off
+  for(int i = 0; i < NPROC; i++){
+    int p_idx = (last_proc_idx + i) % NPROC;
+    p = &proc[p_idx];
+
+    acquire(&p->lock);
+    // Only pick from running user processes that aren't the swap worker
+    if(p->state != USED && p->state != RUNNING && p->state != RUNNABLE){
+      release(&p->lock);
+      continue;
+    }
+    if(p->is_kproc || p->pid <= 2){ // Skip init and swap_out_worker
+      release(&p->lock);
+      continue;
+    }
+
+    // Scan this process's memory
+    // Note: In a true clock, you'd store a 'p->clock_hand' as well
+    for(uint64 va = 0; va < p->sz; va += PGSIZE){
+      pte = walk(p->pagetable, va, 0);
+      
+      if(pte && (*pte & PTE_V) && (*pte & PTE_U)){
+        if(*pte & PTE_A){
+          // Second chance: clear accessed bit
+          *pte &= ~PTE_A;
+        } else {
+          // Found a victim that hasn't been accessed recently!
+          *va_out = va;
+          *p_out = p;
+          last_proc_idx = p_idx; // Move the global hand
+          release(&p->lock);
+          return pte;
+        }
+      }
+    }
+    release(&p->lock);
+  }
+  return 0; // No victim found
+}
+
+void
+handle_swap_in(uint64 va)
+{
+  acquire(&swap_lock);
+  
+  global_swap_req.p = myproc();
+  global_swap_req.va = PGROUNDDOWN(va);
+  global_swap_req.type = SWAP_IN;
+  global_swap_req.is_active = 1;
+  
+  wakeup(&global_swap_req); // Wake worker
+  
+  // Wait for worker to finish
+  while(global_swap_req.is_active)
+    sleep(&global_swap_req, &swap_lock);
+    
+  release(&swap_lock);
+}
+
+void
+create_kernel_process(const char *name, void (*entrypoint)(void))
+{
+  struct proc *p = allocproc();
+  if(p == 0) panic("create_kernel_process: allocproc");
+
+  // safestrcpy is used because p->name is a fixed-size array
+  safestrcpy(p->name, name, sizeof(p->name));
+  
+  p->is_kproc = 1;
+  p->is_swapping = 0;
+  p->vruntime = 0;
+  p->nice = 0;
+  p->weight = 1024;
+
+  // Set up the kernel context to jump to the worker function
+  // ra (return address) is where swtch() jumps to
+  p->context.ra = (uint64)entrypoint;
+  p->context.sp = p->kstack + PGSIZE;
+
+  p->state = RUNNABLE;
+
+  release(&p->lock);
 }

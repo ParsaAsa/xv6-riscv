@@ -5,6 +5,17 @@
 #include "types.h"
 #include "vm.h"
 
+
+#define MAX_SWAP_PAGES 32 // Adjust based on requirements
+enum swap_type { SWAP_OUT, SWAP_IN };
+
+struct swap_request {
+  struct proc *p;      // The process whose page we are swapping
+  uint64 va;           // The virtual address to swap out
+  int is_active;       // Is there a pending request?
+  enum swap_type type;
+};
+
 struct context {
   uint64 ra;
   uint64 sp;
@@ -110,16 +121,24 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  
+
+  int is_kproc;
   uint64 vruntime;
   int nice;
   int weight;
+  int is_swapping;
   struct proc *rq_prev;
   struct proc *rq_next;
   uint timeslice;
   uint runtime;
+  uint64 swap_offsets[MAX_SWAP_PAGES]; // Store disk block address for swapped pages
+  uint64 swapped_vas[MAX_SWAP_PAGES];   // Track which VAs are on disk
 };
 
 int setnice(int pid, int nice);
+
+
+extern struct spinlock swap_lock;
+extern struct swap_request global_swap_req;
 
 #endif  // PROC_H

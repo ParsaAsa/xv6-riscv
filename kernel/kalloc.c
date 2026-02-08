@@ -8,7 +8,7 @@
 #include "spinlock.h"
 #include "riscv.h"
 #include "defs.h"
-
+#include "proc.h"
 
 int refcnt[PHYSTOP / PGSIZE];
 struct spinlock refcnt_lock;
@@ -98,25 +98,62 @@ void kfree(void *pa)
 void *
 kalloc(void)
 {
-    struct run *r;
+  struct run *r;
+  struct proc *p = myproc();
 
-    acquire(&kmem.lock);
-    r = kmem.freelist;
-    if(r)
+  // --- Step 1: Standard Allocation Attempt ---
+  acquire(&kmem.lock);
+  r = kmem.freelist;
+  if(r)
+    kmem.freelist = r->next;
+  release(&kmem.lock);
+
+  // --- Step 2: Out of Memory (OOM) Handling ---
+  if(r == 0){
+    /* Safety Guards: 
+       1. p == 0: We are in early boot (main/kinit). Cannot swap yet.
+       2. p->is_kproc: The swap worker itself or other kernel threads shouldn't trigger swap.
+       3. p->is_swapping: Prevent recursive loops where kalloc -> swap -> kalloc.
+    */
+    if(p != 0 && p->is_kproc == 0 && p->is_swapping == 0){
+      p->is_swapping = 1; // Set the flag to protect this process
+
+      acquire(&swap_lock);
+      // Wake up the swap_out_worker (Phase 2)
+      global_swap_req.is_active = 1;
+      global_swap_req.p = p; 
+      wakeup(&global_swap_req);
+
+      // Wait for the worker to finish evicting a page
+      while(global_swap_req.is_active == 1){
+        sleep(&global_swap_req, &swap_lock);
+      }
+      release(&swap_lock);
+
+      p->is_swapping = 0; // Unset the flag
+
+      // --- Step 3: Final Attempt ---
+      // Try to grab the page the worker just freed
+      acquire(&kmem.lock);
+      r = kmem.freelist;
+      if(r)
         kmem.freelist = r->next;
-    release(&kmem.lock);
-
-    if(r){
-        // Fill with junk to catch dangling refs.
-        memset((char*)r, 5, PGSIZE);
-
-        // Initialize reference count to 1 for this new page
-        acquire(&refcnt_lock);
-        refcnt[(uint64)r / PGSIZE] = 1;
-        release(&refcnt_lock);
+      release(&kmem.lock);
     }
+  }
 
-    return (void*)r;
+  // --- Step 4: Initialization ---
+  if(r){
+    // Fill with junk (5) to catch dangling references
+    memset((char*)r, 5, PGSIZE);
+
+    // Initialize reference count to 1
+    acquire(&refcnt_lock);
+    refcnt[(uint64)r / PGSIZE] = 1;
+    release(&refcnt_lock);
+  }
+
+  return (void*)r;
 }
 
 
