@@ -47,7 +47,9 @@ usertrap(void)
   struct proc *p = myproc();
   p->trapframe->epc = r_sepc();
   
-  if(r_scause() == 8){
+  uint64 scause = r_scause();
+
+  if(scause == 8){
     // System call
     if(killed(p))
       kexit(-1);
@@ -55,27 +57,33 @@ usertrap(void)
     intr_on();
     syscall();
   } else if((which_dev = devintr()) != 0){
-    // Device interrupt (Timer, Disk, etc.)
-  } else if(r_scause() == 13 || r_scause() == 15) {
+    // Device interrupt
+  } else if(scause == 12 || scause == 13 || scause == 15) {
     uint64 va = r_stval();
     
+    // Safety check for trampoline
     if(va >= TRAMPOLINE) {
       setkilled(p);
     } else {
       pte_t *pte = walk(p->pagetable, va, 0);
       
-      // 1. SWAP-IN: Highest priority
+      // 1. Check for SWAP-IN first
       if(pte && (*pte & PTE_SWAP)) {
           handle_swap_in(va);
-          // If the swap failed or the process was killed during disk I/O
+          // Do not fall through to error reporting!
           if(killed(p)) kexit(-1);
+          goto done; // Skip error logs and go to scheduling
       } 
       // 2. COW: Only on Store Page Fault (15)
-      else if(r_scause() == 15 && cowfault(va) >= 0) {
-          // Handled successfully
+      else if(scause == 15 && cowfault(va) >= 0) {
+          goto done;
       }
-      // 3. Lazy Allocation
-      else if(vmfault(p->pagetable, va, (r_scause() == 13)) != 0) {
+      // 3. Lazy Allocation (vmfault returns 0 on success)
+      else if(vmfault(p->pagetable, va, (scause == 13)) == 0) {
+          goto done;
+      } else {
+          // If none of the above, it's a real segfault
+          printf("usertrap(): segfault pid=%d va=%p scause=%p\n", p->pid, (void*)va, (void*)scause);
           setkilled(p);
       }
     }
@@ -85,19 +93,18 @@ usertrap(void)
     setkilled(p);
   }
 
+done:
   if(killed(p))
     kexit(-1);
 
-  // --- CFS Scheduler Logic ---
+  // CFS Scheduler Logic
   if(which_dev == 2){
     if(p){
       p->runtime++;
-      // Weight-based vruntime increment
       p->vruntime += (NICE_0_LOAD / p->weight);
 
       if(p->runtime >= p->timeslice){
         p->runtime = 0;
-        // Check for held locks before yielding to prevent 'sched locks' panic
         yield();
       }
     }

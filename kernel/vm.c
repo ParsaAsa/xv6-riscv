@@ -8,6 +8,11 @@
 #include "proc.h"
 #include "fs.h"
 
+
+
+extern int swap_map[1024];
+extern struct spinlock swap_mem_lock;
+
 /*
  * the kernel's page table.
  */
@@ -199,10 +204,23 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+    if((pte = walk(pagetable, a, 0)) == 0)
       continue;   
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
+
+    // --- NEW LOGIC START: Release Swap Slots ---
+    if(*pte & PTE_SWAP){
+      int slot = (*pte) >> 12;
+      acquire(&swap_mem_lock);
+      swap_map[slot] = 0; // Make slot available again
+      release(&swap_mem_lock);
+      *pte = 0;
+      continue; 
+    }
+    // --- NEW LOGIC END ---
+
+    if((*pte & PTE_V) == 0)
       continue;
+
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       decref(pa);
@@ -304,6 +322,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
 
+
+    // --- NEW LOGIC START ---
+    if(*pte & PTE_SWAP){
+      int slot = (*pte) >> 12;
+      acquire(&swap_mem_lock);
+      swap_map[slot] = 0; // Release the disk slot
+      release(&swap_mem_lock);
+      *pte = 0;
+      continue; // Nothing to kfree because it's on disk, not in RAM
+    }
+    // --- NEW LOGIC END ---
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
 

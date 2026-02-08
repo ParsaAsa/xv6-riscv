@@ -9,6 +9,12 @@
 #include "rbt.h"
 #include "proc.h"
 
+
+// Global Backing Store (The "Disk" in RAM)
+char swap_storage[1024][4096]; 
+int swap_map[1024];
+struct spinlock swap_mem_lock; // Recommended: to protect the swap_map
+
 void create_kernel_process(const char *name, void (*entrypoint)(void));
 void swap_out_worker(void);
 pte_t *select_victim_page(uint64 *va_out, struct proc **p_out);
@@ -147,6 +153,8 @@ procinit(void)
       p->vruntime = 0;
       p->kstack = KSTACK((int) (p - proc));
   }
+  initlock(&swap_mem_lock, "swap_mem");
+  memset(swap_map, 0, sizeof(swap_map));
 }
 
 // Must be called with interrupts disabled,
@@ -820,58 +828,61 @@ void
 swap_out_worker(void)
 {
   struct proc *kproc = myproc();
-
-  // The worker starts in the scheduler with kproc->lock held.
-  // We must release it once and ONLY once before entering the loop.
-  if(holding(&kproc->lock))
-    release(&kproc->lock);
+  if(holding(&kproc->lock)) release(&kproc->lock);
 
   for(;;){
     acquire(&swap_lock);
     while(global_swap_req.is_active == 0)
       sleep(&global_swap_req, &swap_lock);
-
-    // Set swapping flag so this kproc can bypass the kalloc reserve
+    
     kproc->is_swapping = 1;
+    release(&swap_lock);
 
     uint64 va;
     struct proc *victim_p = 0;
-    
-    // select_victim_page returns with victim_p->lock ACQUIRED
     pte_t *pte = select_victim_page(&va, &victim_p);
 
-if(pte != 0 && victim_p != 0){
+    if(pte != 0 && victim_p != 0){
       uint64 pa = PTE2PA(*pte);
-      
-      int slot = swap_alloc_slot();
-      if(slot < 0) {
-        printf("Swap-out: No disk space!\n");
-        release(&victim_p->lock);
-        goto skip;
+      int slot = -1;
+
+      // --- CRITICAL SECTION START ---
+      acquire(&swap_mem_lock);
+      for(int i = 0; i < 1024; i++){
+        if(swap_map[i] == 0){
+          swap_map[i] = 1; // RESERVE THE SLOT IMMEDIATELY
+          slot = i;
+          break;
+        }
       }
+      release(&swap_mem_lock);
+      // --- CRITICAL SECTION END ---
 
-      // 1. Copy data to "disk"
-      extern char swap_disk[128][4096]; // Tell compiler it's in kalloc.c
-      memmove(swap_disk[slot], (void*)pa, PGSIZE);
+      if(slot != -1){
+        // Move data to reserved slot
+        memmove(swap_storage[slot], (void*)pa, PGSIZE);
 
-      // 2. Mark PTE with the slot number
-      // We store the slot in the high bits of the PTE (above the flags)
-      uint64 flags = PTE_FLAGS(*pte);
-      *pte = ((uint64)slot << 12) | flags | PTE_SWAP; 
-      *pte &= ~PTE_V; // Mark invalid
+        // Update PTE while holding victim_p->lock
+        uint64 flags = PTE_FLAGS(*pte);
+        *pte = ((uint64)slot << 12) | flags | PTE_SWAP;
+        *pte &= ~PTE_V;
 
-      sfence_vma();
-      release(&victim_p->lock); 
-      kfree((void*)pa);
+        sfence_vma();
 
-      printf("Swap-out: VA %p -> Slot %d\n", (void*)va, slot);
+        int pid_val = victim_p->pid;
+        release(&victim_p->lock); 
+
+        // Cleanup
+        kfree((void*)pa);
+        printf("Swap-out: PID %d VA %p -> Slot %d\n", pid_val, (void*)va, slot);
+      } else {
+        release(&victim_p->lock);
+      }
     }
-    skip:
 
+    acquire(&swap_lock);
     kproc->is_swapping = 0;
     global_swap_req.is_active = 0;
-    
-    // Wake up the kalloc() that is sleeping on this request
     wakeup(&global_swap_req);
     release(&swap_lock);
   }
@@ -890,7 +901,6 @@ select_victim_page(uint64 *va_out, struct proc **p_out)
     int p_idx = (last_proc_idx + i) % NPROC;
     p = &proc[p_idx];
 
-    // Don't try to lock if we are already holding it (safety)
     if(holding(&p->lock)) continue;
 
     acquire(&p->lock);
@@ -900,12 +910,23 @@ select_victim_page(uint64 *va_out, struct proc **p_out)
       continue;
     }
 
-    // 2. Only scan up to p->sz. 
-    // This naturally avoids TRAPFRAME and TRAMPOLINE which are ABOVE p->sz.
+    // 2. Scan the address space
     for(uint64 va = 0; va < p->sz; va += PGSIZE){
+      
+      // --- SAFETY GUARDS START ---
+      // Guard A: Protect the first 3 pages (usually binary code/init)
+      if(va < 3 * PGSIZE) 
+        continue;
+
+      // Guard B: Protect the last 3 pages (the process stack)
+      // If we evict the stack, the process will crash immediately on next syscall.
+      if(va >= p->sz - 3 * PGSIZE)
+        continue;
+      // --- SAFETY GUARDS END ---
+
       pte = walk(p->pagetable, va, 0);
       
-      // 3. CRITICAL: Only evict if Valid, User, and NOT already Swapped
+      // 3. Only evict if Valid, User, and NOT already Swapped
       if(pte && (*pte & PTE_V) && (*pte & PTE_U) && !(*pte & PTE_SWAP)){
         if(*pte & PTE_A){
           *pte &= ~PTE_A; // Second chance
@@ -913,7 +934,7 @@ select_victim_page(uint64 *va_out, struct proc **p_out)
           *va_out = va;
           *p_out = p;
           last_proc_idx = p_idx; 
-          // Return with p->lock HELD (the worker will release it)
+          // Return with p->lock HELD
           return pte;
         }
       }
@@ -923,41 +944,39 @@ select_victim_page(uint64 *va_out, struct proc **p_out)
   return 0;
 }
 
-// kernel/proc.c
-
 void
 handle_swap_in(uint64 va)
 {
   struct proc *p = myproc();
-  va = PGROUNDDOWN(va);
-  
-  pte_t *pte = walk(p->pagetable, va, 0);
+  uint64 va_down = PGROUNDDOWN(va);
+  pte_t *pte = walk(p->pagetable, va_down, 0);
+
   if(!pte || !(*pte & PTE_SWAP)) return;
 
-  // 1. Get the slot we stored earlier
-  int slot = (*pte) >> 12;
+  // 1. Get a new physical page
+  char *pa = kalloc(); 
+  if(pa == 0) panic("handle_swap_in: kalloc");
 
-  // 2. Allocate a fresh physical page
-  char *pa = kalloc();
-  if(pa == 0){
-    // If kalloc returns 0, kalloc is already handling the sleep/swap logic
-    // We just return and let usertrap retry the instruction.
-    return; 
-  }
+  // 2. Find the slot index
+  // We extract the top bits where we hid the index
+  int slot = (*pte) >> 12; 
 
-  // 3. Copy data back from fake disk
-  extern char swap_disk[128][4096];
-  extern int swap_map[128];
-  memmove(pa, swap_disk[slot], PGSIZE);
+  // 3. Copy data back
+  memmove(pa, swap_storage[slot], PGSIZE);
   
-  // 4. Update PTE: Set Valid, Clear Swap bit, Link to new PA
+  // 4. Update the PTE
   uint64 flags = PTE_FLAGS(*pte);
-  flags &= ~PTE_SWAP;
-  flags |= PTE_V;
-  *pte = PA2PTE(pa) | flags;
+  flags |= PTE_V;      
+  flags &= ~PTE_SWAP;  
+  // Update the PTE...
+  *pte = PA2PTE(pa) | flags | PTE_V;
 
-  // 5. Free the disk slot
+  // CRITICAL: Tell ALL cores to refresh their page table cache
+  sfence_vma();
+  // 5. Free the slot safely
+  acquire(&swap_mem_lock);
   swap_map[slot] = 0;
+  release(&swap_mem_lock);
 
   sfence_vma();
 }
@@ -985,4 +1004,20 @@ create_kernel_process(const char *name, void (*entrypoint)(void))
   p->state = RUNNABLE;
 
   release(&p->lock);
+}
+
+
+void
+proc_free_swapped_pages(pagetable_t pt, uint64 sz)
+{
+  for(uint64 i = 0; i < sz; i += PGSIZE){
+    pte_t *pte = walk(pt, i, 0);
+    if(pte && (*pte & PTE_SWAP)){
+      int slot = (*pte) >> 12;
+      acquire(&swap_mem_lock);
+      swap_map[slot] = 0; // Release the slot
+      release(&swap_mem_lock);
+      *pte = 0;
+    }
+  }
 }

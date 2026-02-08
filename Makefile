@@ -154,6 +154,8 @@ UPROGS=\
 	$U/_cowtest\
 	$U/_hog\
 	$U/_testswap\
+	$U/_stress\
+
 
 
 

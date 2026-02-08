@@ -10,8 +10,10 @@
 #include "defs.h"
 #include "proc.h"
 
-char swap_disk[MAX_SWAP_PAGES][PGSIZE]; // Our fake storage
-int swap_map[MAX_SWAP_PAGES];           // 0 = free, 1 = used
+// kernel/kalloc.c
+extern char swap_storage[1024][4096];
+extern int swap_map[1024];
+extern struct spinlock swap_mem_lock;
 
 // Find a free slot in our fake disk
 int swap_alloc_slot() {
@@ -118,45 +120,58 @@ kalloc(void)
   struct run *r;
   struct proc *p = myproc();
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  
-  // Reserve check
-  if(r && npage < 32 && p && !p->is_kproc && !p->is_swapping) {
-    r = 0; 
-  }
+  while(1) {
+    acquire(&kmem.lock);
+    r = kmem.freelist;
 
-  if(r) {
-    kmem.freelist = r->next;
-    npage--;
-    release(&kmem.lock); // RELEASE HERE: We got a page, we are done with kmem.lock
-  } else {
-    release(&kmem.lock); // RELEASE HERE: We didn't get a page, must release before sleeping/recursing
+    // Reserve check: 
+    // If we have few pages left (npage < 32), and this is a normal 
+    // user process, we DENY the page to force them to trigger swapping.
+    // This ensures the kernel/worker always has a small buffer to work with.
+    if(r && npage < 32 && p && !p->is_kproc && !p->is_swapping) {
+      r = 0; 
+    }
 
-    // Try to trigger swap if we are a user process
-    if(p && !p->is_kproc && !p->is_swapping) {
+    if(r) {
+      // Success: We found a page
+      kmem.freelist = r->next;
+      npage--;
+      release(&kmem.lock);
+      break; // Exit the loop to finish initialization
+    } else {
+      // Failure: No pages available (or reserve hit)
+      release(&kmem.lock);
+
+      // CRITICAL: Only sleep/swap if we have a process context 
+      // AND we aren't the worker itself (to avoid infinite deadlock).
+      if(p && !p->is_kproc && !p->is_swapping) {
         acquire(&swap_lock);
-        // ... trigger worker ...
+        
+        // 1. Tell the worker there is a job to do
+        global_swap_req.is_active = 1;
+        
+        // 2. Wake up the swap_out_worker
+        wakeup(&global_swap_req);
+
+        // 3. Sleep until the worker wakes us back up
         sleep(&global_swap_req, &swap_lock);
         release(&swap_lock);
 
-        // Check if the worker actually freed any pages
-        acquire(&kmem.lock);
-        int pages_now = npage;
-        release(&kmem.lock);
+        // After waking up, we loop back to the 'while(1)' to try again.
+        // If the worker freed a page, we will get it.
+        // If not, we might loop again or hit the panic below.
+        continue; 
+      }
 
-        if(pages_now < 32) {
-            printf("Out of memory and swap space! Killing PID %d\n", p->pid);
-            setkilled(p);
-            return 0;
-        }
-        return kalloc(); 
-}
-    return 0;
+      // If we are the kernel or the worker and we are truly out of memory:
+      return 0; 
+    }
   }
 
-  // Initialization (Outside the lock)
+  // Initialization of the found page
   memset((char*)r, 5, PGSIZE);
+
+  // Update reference count
   acquire(&refcnt_lock);
   refcnt[(uint64)r / PGSIZE] = 1;
   release(&refcnt_lock);

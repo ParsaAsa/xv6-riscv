@@ -92,6 +92,8 @@ void            panic(char*) __attribute__((noreturn));
 void            printfinit(void);
 
 // proc.c
+void    proc_free_swapped_pages(pagetable_t pt, uint64 sz);
+
 void            create_kernel_process(const char*, void (*)(void));
 extern struct spinlock swap_lock;
 extern struct swap_request global_swap_req;
